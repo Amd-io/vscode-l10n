@@ -4,10 +4,12 @@
  *--------------------------------------------------------------------------------------------*/
 
 import merge from 'deepmerge-json';
-import { localize } from 'pseudo-localization';
 import { ScriptAnalyzer } from "./ast/analyzer";
 import { IScriptFile, l10nJsonDetails, l10nJsonFormat } from './common';
+import { logger } from './logger';
 import { XLF } from "./xlf/xlf";
+import { azureTranslatorTranslate } from './translators/azure';
+import { pseudoLocalizedTranslate } from './translators/pseudo';
 
 export { l10nJsonDetails, l10nJsonFormat, l10nJsonMessageFormat, IScriptFile } from './common';
 
@@ -31,12 +33,26 @@ export interface L10nToXlfOptions {
  * @returns l10nJsonFormat
  */
 export async function getL10nJson(fileContents: IScriptFile[]): Promise<l10nJsonFormat> {
+	logger.debug(`Analyzing ${fileContents.length} script files...`);
+
+	// Create a Set to keep track of keys that have been seen before
+	const seenKeys = new Set<string>();
 	const bundles: l10nJsonFormat[] = [];
 	for (const contents of fileContents) {
 		const result = await analyzer.analyze(contents);
 		bundles.push(result);
+
+		// Validation
+		for (const [key, value] of Object.entries(result)) {
+			if (seenKeys.has(key)) {
+				logger.verbose(`The string '${key}' without comments has been seen multiple times.`);
+			} else if (typeof value === 'string' || !value.comment.length) {
+				seenKeys.add(key);
+			}
+		}
 	}
 
+	logger.debug('Analyzed script files.');
 	const mergedJson: l10nJsonFormat = merge.multi({}, ...bundles);
 	return mergedJson;
 }
@@ -49,10 +65,14 @@ export async function getL10nJson(fileContents: IScriptFile[]): Promise<l10nJson
  * @returns XLF data as a string
  */
 export function getL10nXlf(l10nFileContents: Map<string, l10nJsonFormat>, options?: L10nToXlfOptions): string {
+	logger.debug(`Analyzing ${l10nFileContents.size} L10N files...`);
 	const xlf = new XLF(options)
 	for (const [name, l10nBundle] of l10nFileContents) {
+		logger.debug(`Adding file ${name}...`);
 		xlf.addFile(name, l10nBundle);
+		logger.debug(`Added file ${name}.`);
 	}
+	logger.debug('Analyzed L10N files.');
 	return xlf.toString();
 }
 
@@ -63,17 +83,22 @@ export function getL10nXlf(l10nFileContents: Map<string, l10nJsonFormat>, option
  * @returns Array of l10nJsonDetails
  */
 export async function getL10nFilesFromXlf(xlfContents: string): Promise<l10nJsonDetails[]> {
+	logger.debug('Parsing XLF content...');
 	const details = await XLF.parse(xlfContents);
+	logger.debug(`Parsed XLF contents into ${details.length}.`);
 	details.forEach(detail => {
+		logger.debug(`Found ${detail.language} file with ${Object.keys(detail.messages).length} messages called '${detail.name}'.`);
 		switch (detail.language) {
 			// Fix up the language codes for the languages we ship as language packs
 			case 'zh-hans':
 				// https://github.com/microsoft/vscode-loc/blob/ee1a0b34bb545253a8a28e6d21193052c478e32d/i18n/vscode-language-pack-zh-hans/package.json#L22
 				detail.language = 'zh-cn';
+				logger.debug(`Changed 'zh-hans' to 'zh-cn' for file: ${detail.name}.`);
 				break;
 			case 'zh-hant':
 				// https://github.com/microsoft/vscode-loc/blob/ee1a0b34bb545253a8a28e6d21193052c478e32d/i18n/vscode-language-pack-zh-hant/package.json#L22
 				detail.language = 'zh-tw';
+				logger.debug(`Changed 'zh-hant' to 'zh-tw' for file: ${detail.name}.`);
 				break;
 			default:
 				break;
@@ -89,23 +114,29 @@ export async function getL10nFilesFromXlf(xlfContents: string): Promise<l10nJson
  * @returns l10nJsonFormat
  */
 export function getL10nPseudoLocalized(dataToLocalize: l10nJsonFormat): l10nJsonFormat {
-	// deep clone
-	const contents = JSON.parse(JSON.stringify(dataToLocalize));
-	for(const key of Object.keys(contents)) {
-		const value = contents[key];
-		const message = typeof value === 'string' ? value : value!.message;
-		let index = 0;
-		let localized = '';
-		// escape command and icon syntax
-		for (const match of message.matchAll(/(?:\(command:\S+)|(?:\$\([A-Za-z-~]+\))|(?:\{\S+\})/g)) {
-			const section = localize(message.substring(index, match.index));
-			localized += section + match[0]!;
-			index = match.index! + match[0]!.length;
-		}
+	logger.debug('Localizing data using pseudo-localization...');
+	
+	const result = pseudoLocalizedTranslate(dataToLocalize);
+	logger.debug(`Pseudo-localized ${Object.keys(result).length} strings.`);
+	return result;
+}
 
-		contents[key] = index === 0
-			? localize(message)
-			: localized + localize(message.substring(index));
+/**
+ * @public
+ * Get pseudo localized l10n data for a given l10n bundle
+ * @param dataToLocalize - package.nls.json or bundle.l10n.json contents parsed
+ * @param languages - languages to translate to
+ * @param config - configuration for the Azure Translator instance
+ * @returns l10nJsonFormat[] where each element is the localized data for that respective language in the languages array
+ */
+export async function getL10nAzureLocalized(dataToLocalize: l10nJsonFormat, languages: string[], config: { azureTranslatorKey: string, azureTranslatorRegion: string }): Promise<l10nJsonFormat[]> {
+	logger.debug('Localizing data using Azure...');
+
+	const result = await azureTranslatorTranslate(dataToLocalize, languages, config);
+	if (result.length) {
+		logger.debug(`Localized ${Object.keys(result[0]!).length * languages.length} strings.`);
+	} else {
+		logger.debug('No strings localized.');
 	}
-	return contents;
+	return result;
 }

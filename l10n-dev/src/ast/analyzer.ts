@@ -7,6 +7,7 @@ import * as path from 'path';
 import Parser, { QueryMatch } from "web-tree-sitter";
 import { IScriptFile, l10nJsonFormat } from "../common";
 import { importOrRequireQuery, getTQuery, IAlternativeVariableNames } from "./queries";
+import { unescapeString } from './unescapeString';
 
 // Workaround for https://github.com/tree-sitter/tree-sitter/issues/1765
 try {
@@ -56,36 +57,51 @@ export class ScriptAnalyzer {
 		if (!commentCapture) {
 			return [];
 		}
-		if (commentCapture.node.type === 'string') {
+		if (commentCapture.node.type === 'string' || commentCapture.node.type === 'template_string') {
 			const text = commentCapture.node.text;
-			// remove quotes using indirect eval
-			return [(0, eval)(text)];
+			return [this.#getUnquotedString(text)];
 		}
 
 		// we have an array of comments
 		return commentCapture.node.children
-			.filter(c => c.type === 'string')
-			// remove quotes using indirect eval
-			.map(c => (0, eval)(c.text));
+			.filter(c => c.type === 'string' || c.type === 'template_string')
+			.map(c => this.#getUnquotedString(c.type === 'string' ? c.text : this.#getTemplateValueFromTemplateRawValue(c.text)));
 	}
 
-	#getStringFromMatch(match: QueryMatch, id: string, removeQuotes: boolean): string | undefined {
+	/**
+	 * For template strings, the actual template value (TV) is normalized to using LF (\n) as line separator.
+	 * however, the template raw value (TRV) is the original value, which may use CRLF (\r\n) as line separator.
+	 * So we need to normalize the TRV to use LF as line separator so that at runtime, these two values are the same.
+	 * See NOTE in https://tc39.es/ecma262/2021/#sec-static-semantics-tv-and-trv
+	 */
+	#getTemplateValueFromTemplateRawValue(templateRawValue: string): string {
+		return templateRawValue.replace(/\r\n/g, '\n');
+	}
+
+	#getStringFromMatch(match: QueryMatch, id: string, unescape: boolean): string | undefined {
 		const capture = match.captures.find(c => c.name === id);
 		if (!capture) {
 			return undefined;
 		}
-		const text = capture.node.text;
+		let text = capture.node.text;
+		if (capture.node.type === 'template_string') {
+			text = this.#getTemplateValueFromTemplateRawValue(text);
+		}
 		// remove quotes
-		if (!removeQuotes) {
+		if (!unescape) {
 			return text;
 		}
 
+		return this.#getUnquotedString(text);
+	}
+
+	#getUnquotedString(text: string): string {
 		const character = text[0];
 		if (character !== '\'' && character !== '"' && character !== '`') {
 			return text;
 		}
-		// remove quotes using indirect eval
-		return (0, eval)(text);
+
+		return unescapeString(text.slice(1, -1));
 	}
 
 	#getImportDetails(match: QueryMatch): IAlternativeVariableNames {
@@ -105,7 +121,7 @@ export class ScriptAnalyzer {
 				// import { l10n as foo } from 'vscode' or import { l10n } from 'vscode'
 				? { l10n: namedImportAlias }
 				// import { t as foo } from '@vscode/l10n' or import { t } from '@vscode/l10n'
-				:  { t: namedImportAlias };
+				: { t: namedImportAlias };
 		}
 
 		// we have required vscode or @vscode/l10n
@@ -142,7 +158,7 @@ export class ScriptAnalyzer {
 		}
 
 		let parser, grammar;
-		switch(extension) {
+		switch (extension) {
 			case '.jsx':
 			case '.tsx':
 				grammar = await ScriptAnalyzer.#tsxGrammar;
@@ -166,14 +182,31 @@ export class ScriptAnalyzer {
 		const bundle: l10nJsonFormat = {};
 		for (const importMatch of importMatches) {
 			const importDetails = this.#getImportDetails(importMatch);
-			const tQuerys = getTQuery(importDetails);
-			const tQuery = grammar.query(tQuerys);
-			const matches = tQuery.matches(parsed.rootNode);
-
+			const query = grammar.query(getTQuery(importDetails));
+			const matches = query.matches(parsed.rootNode);
 			for (const match of matches) {
-				const message = this.#getStringFromMatch(match, 'message', true)!;
-				const comment = this.#getCommentsFromMatch(match);
+				const taggedTemplate = match.captures.find(c => c.name === 'tagged_template');
+				let message: string;
+				// handles l10n.t`foo`
+				if (taggedTemplate) {
+					const subs = match.captures.filter(c => c.name === 'sub');
+					const start = taggedTemplate.node.startIndex;
+					message = this.#getTemplateValueFromTemplateRawValue(taggedTemplate.node.text);
+					for (let i = subs.length - 1; i >= 0; i--) {
+						const sub = subs[i]!;
+						message = message.slice(0, sub.node.startIndex - start) + `{${i}}` + message.slice(sub.node.endIndex - start);
+					}
+					message = this.#getUnquotedString(message);
+				} else {
+					// handles l10n.t(`foo`)
+					message = this.#getStringFromMatch(match, 'message', true)!;
+					const hasMessageTemplateArgs = match.captures.find(c => c.name === 'message_template_arg');
+					if (hasMessageTemplateArgs) {
+						throw new Error(`Message '${message}' contains args via template substitution, i.e. 'l10n.t(\`$\{foo}\`)'. Please use double quotes and pass args, i.e. 'l10n.t(\`{0}\`, foo)'.`);
+					}
+				}
 
+				const comment = this.#getCommentsFromMatch(match);
 				if (comment.length) {
 					const key = `${message}/${comment.join('')}`;
 					bundle[key] = { message, comment };

@@ -6,14 +6,41 @@
 import { mkdirSync, readFileSync, writeFileSync } from "fs";
 import path from "path";
 import * as glob from 'glob';
-import { getL10nFilesFromXlf, getL10nJson, getL10nPseudoLocalized, getL10nXlf } from "./main";
+import { getL10nAzureLocalized, getL10nFilesFromXlf, getL10nJson, getL10nPseudoLocalized, getL10nXlf, l10nJsonFormat } from "./main";
 import yargs from 'yargs';
 import { hideBin } from 'yargs/helpers';
-import { IScriptFile, l10nJsonFormat } from "./common";
+import { logger, LogLevel } from "./logger";
+
+const GLOB_DEFAULTS = {
+	// We only want files.
+	nodir: true,
+	// Absolute paths are easier to work with.
+	absolute: true,
+	// Ultimately, we should remove this but I worry that folks have already taken advantage of the fact that we handled Windows paths.
+	// For now, we'll keep it, but in the future, we should remove it.
+	windowsPathsNoEscape: true
+};
 
 yargs(hideBin(process.argv))
 .scriptName("vscode-l10n-dev")
 .usage('$0 <cmd> [args]')
+.option('verbose', {
+	alias: 'v',
+	boolean: true,
+	describe: 'Enable verbose logging'
+})
+.option('debug', {
+	alias: 'd',
+	boolean: true,
+	describe: 'Enable debug logging'
+})
+.middleware(function (argv) {
+	if (argv.debug) {
+		logger.setLogLevel(LogLevel.Debug);
+	} else if (argv.verbose) {
+		logger.setLogLevel(LogLevel.Verbose);
+	}
+})
 .command(
 	'export [args] <path..>',
 	'Export strings from source files. Supports glob patterns.',
@@ -22,7 +49,6 @@ yargs(hideBin(process.argv))
 			demandOption: true,
 			type: 'string',
 			array: true,
-			normalize: true,
 			describe: 'TypeScript files to extract strings from. Supports folders and glob patterns.'
 		});
 		yargs.option('outDir', {
@@ -99,48 +125,67 @@ yargs(hideBin(process.argv))
 	}, function (argv) {
 		l10nGeneratePseudo(argv.path as string[], argv.language as string);
 	})
+.command(
+	'generate-azure [args] <path..>',
+	'(Experimental) Generate language files for `*.l10n.json` or `package.nls.json` files. You must create an Azure Translator instance, get the key and region, and set the AZURE_TRANSLATOR_KEY and AZURE_TRANSLATOR_REGION environment variables to these values.',
+	yargs => {
+		yargs.positional('path', {
+			demandOption: true,
+			type: 'string',
+			array: true,
+			normalize: true,
+			describe: 'L10N JSON files to generate an XLF from. Supports folders and glob patterns.'
+		});
+		yargs.option('languages', {
+			alias: 'l',
+			type: 'string',
+			array: true,
+			default: ['fr', 'it', 'de', 'es', 'ru', 'zh-cn', 'zh-tw', 'ja', 'ko', 'cs', 'pt-br', 'tr', 'pl'],
+			describe: 'The Pseudo language identifier that will be used.'
+		});
+		yargs.env('AZURE_TRANSLATOR');
+	}, async function (argv) {
+		if (!argv.key) {
+			throw new Error('AZURE_TRANSLATOR_KEY environment variable is not defined.');
+		}
+		if (!argv.region) {
+			throw new Error('AZURE_TRANSLATOR_REGION environment variable is not defined.');
+		}
+		await l10nGenerateTranslationService(
+			argv.path as string[],
+			argv.languages as string[],
+			argv.key as string,
+			argv.region as string
+		);
+	})
 .help().argv;
 
 export async function l10nExportStrings(paths: string[], outDir?: string): Promise<void> {
-	console.log('Searching for TypeScript/JavaScript files...');
-	const matches = paths.map(p => glob.sync(toPosixPath(p))).flat();
-	const tsFileContents = matches.reduce<IScriptFile[]>((prev, curr) => {
-		const ext = path.extname(curr);
-		switch(ext) {
-			case '.ts':
-			case '.tsx':
-			case '.js':
-			case '.jsx':
-				prev.push({
-					extension: ext,
-					contents: readFileSync(path.resolve(curr), 'utf8')
-				});
-				break;
-		}
-		const results = glob.sync(path.posix.join(curr, '{,**}', '*.{ts,tsx,js,jsx}'));
-		for (const result of results) {
-			prev.push({
-				extension: path.extname(result),
-				contents: readFileSync(path.resolve(result), 'utf8')
-			});
-		}
-		return prev;
-	}, []);
+	logger.log('Searching for TypeScript/JavaScript files...');
+
+	const matches = glob.sync(
+		paths.map(p => /\.(ts|tsx|js|jsx)$/.test(p) ? p : path.posix.join(p, '{,**}', '*.{ts,tsx,js,jsx}')),
+		GLOB_DEFAULTS
+	);
+	const tsFileContents = matches.map(m => ({
+		extension: path.extname(m),
+		contents: readFileSync(path.resolve(m), 'utf8')
+	}));
 
 	if (!tsFileContents.length) {
-		console.log('No TypeScript files found.');
+		logger.log('No TypeScript files found.');
 		return;
 	}
 
-	console.log(`Found ${tsFileContents.length} TypeScript files. Extracting strings...`);
+	logger.log(`Found ${tsFileContents.length} TypeScript files. Extracting strings...`);
 	const jsonResult = await getL10nJson(tsFileContents);
 
 	const stringsFound = Object.keys(jsonResult).length;
 	if (!stringsFound) {
-		console.log('No strings found. Skipping writing to a bundle.l10n.json.');
+		logger.log('No strings found. Skipping writing to a bundle.l10n.json.');
 		return;
 	}
-	console.log(`Extracted ${stringsFound} strings...`);
+	logger.log(`Extracted ${stringsFound} strings...`);
 
 	let packageJSON;
 	try {
@@ -150,7 +195,7 @@ export async function l10nExportStrings(paths: string[], outDir?: string): Promi
 	}
 	if (packageJSON) {
 		if (outDir) {
-			if (!packageJSON.l10n || path.resolve(packageJSON.l10n) === path.resolve(outDir)) {
+			if (!packageJSON.l10n || path.resolve(packageJSON.l10n) !== path.resolve(outDir)) {
 				console.warn('The l10n property in the package.json does not match the outDir specified. For an extension to work correctly, l10n must be set to the location of the bundle files.');
 			}
 		} else {
@@ -170,57 +215,48 @@ export async function l10nExportStrings(paths: string[], outDir?: string): Promi
 }
 
 export function l10nGenerateXlf(paths: string[], language: string, outFile: string): void {
-	console.log('Searching for L10N JSON files...');
-	const matches = paths.map(p => glob.sync(toPosixPath(p))).flat();
-	const l10nFileContents = matches.reduce<Map<string, l10nJsonFormat>>((prev, curr) => {
-		const results = curr.endsWith('.l10n.json') || curr.endsWith('package.nls.json')
-			? [curr]
-			: glob.sync(path.posix.join(curr, `{,!(node_modules)/**}`, '{*.l10n.json,package.nls.json}'));
-		for (const result of results) {
-			if (result.endsWith('.l10n.json')) {
-				const name = path.basename(curr).split('.l10n.json')[0] ?? '';
-				prev.set(name, JSON.parse(readFileSync(path.resolve(curr), 'utf8')));
-				return prev;
-			}
-			if (result.endsWith('package.nls.json')) {
-				prev.set('package', JSON.parse(readFileSync(path.resolve(curr), 'utf8')));
-				return prev;
-			}
+	logger.log('Searching for L10N JSON files...');
+
+	const matches = glob.sync(
+		paths.map(p => /(\.l10n\.json|package\.nls\.json)$/.test(p) ? p : path.posix.join(p, `{,!(node_modules)/**}`, '{*.l10n.json,package.nls.json}')),
+		GLOB_DEFAULTS
+	);
+
+	const l10nFileContents = new Map<string, l10nJsonFormat>();
+	for (const match of matches) {
+		if (match.endsWith('.l10n.json')) {
+			const name = path.basename(match).split('.l10n.json')[0] ?? '';
+			l10nFileContents.set(name, JSON.parse(readFileSync(path.resolve(match), 'utf8')));
+		} else if (match.endsWith('package.nls.json')) {
+			l10nFileContents.set('package', JSON.parse(readFileSync(path.resolve(match), 'utf8')));
 		}
-		return prev;
-	}, new Map());
+	}
 
 	if (!l10nFileContents.size) {
-		console.log('No L10N JSON files found so skipping generating XLF.');
+		logger.log('No L10N JSON files found so skipping generating XLF.');
 		return;
 	}
-	console.log(`Found ${l10nFileContents.size} L10N JSON files. Generating XLF...`);
+	logger.log(`Found ${l10nFileContents.size} L10N JSON files. Generating XLF...`);
 
 	const result = getL10nXlf(l10nFileContents, { sourceLanguage: language });
 	writeFileSync(path.resolve(outFile), result);
-	console.log(`Wrote XLF file to: ${outFile}`);
+	logger.log(`Wrote XLF file to: ${outFile}`);
 }
 
 export async function l10nImportXlf(paths: string[], outDir: string): Promise<void> {
-	console.log('Searching for XLF files...');
-	const matches = paths.map(p => glob.sync(toPosixPath(p))).flat();
-	const xlfFiles = matches.reduce<string[]>((prev, curr) => {
-		if (curr.endsWith('.xlf')) {
-			prev.push(readFileSync(path.resolve(curr), 'utf8'));
-		}
-		const results = glob.sync(path.posix.join(curr, `{,!(node_modules)/**}`, '*.xlf'));
-		for (const result of results) {
-			prev.push(readFileSync(path.resolve(result), 'utf8'));
-		}
-		return prev;
-	}, []);
+	logger.log('Searching for XLF files...');
 
+	const matches = glob.sync(
+		paths.map(p => /\.xlf$/.test(p) ? p : path.posix.join(p, `{,!(node_modules)/**}`, '*.xlf')),
+		GLOB_DEFAULTS
+	);
+	const xlfFiles = matches.map(m => readFileSync(path.resolve(m), 'utf8'));
 	if (!xlfFiles.length) {
-		console.log('No XLF files found.');
+		logger.log('No XLF files found.');
 		return;
 	}
 
-	console.log(`Found ${xlfFiles.length} XLF files. Generating localized L10N JSON files...`);
+	logger.log(`Found ${xlfFiles.length} XLF files. Generating localized L10N JSON files...`);
 	let count = 0;
 
 	if (xlfFiles.length) {
@@ -238,42 +274,74 @@ export async function l10nImportXlf(paths: string[], outDir: string): Promise<vo
 			);
 		}
 	}
-	console.log(`Wrote ${count} localized L10N JSON files to: ${outDir}`);
+	logger.log(`Wrote ${count} localized L10N JSON files to: ${outDir}`);
 }
 
-function l10nGeneratePseudo(paths: string[], language: string): void {
-	console.log('Searching for L10N JSON files...');
-	const matches = paths.map(p => glob.sync(toPosixPath(p))).flat();
-	matches.forEach(curr => {
-		const results = curr.endsWith('.l10n.json') || curr.endsWith('package.nls.json')
-			? [curr]
-			: glob.sync(path.posix.join(curr, `{,!(node_modules)/**}`, '{*.l10n.json,package.nls.json}'));
-		for (const result of results) {
-			if (result.endsWith('.l10n.json')) {
-				const name = path.basename(curr).split('.l10n.json')[0] ?? '';
-				const contents = getL10nPseudoLocalized(JSON.parse(readFileSync(path.resolve(curr), 'utf8')));
+export function l10nGeneratePseudo(paths: string[], language: string): void {
+	logger.log('Searching for L10N JSON files...');
+
+	const matches = glob.sync(
+		paths.map(p => /(\.l10n\.json|package\.nls\.json)$/.test(p) ? p : path.posix.join(p, `{,!(node_modules)/**}`, '{*.l10n.json,package.nls.json}')),
+		GLOB_DEFAULTS
+	);
+
+	for (const match of matches) {
+		const contents = getL10nPseudoLocalized(JSON.parse(readFileSync(path.resolve(match), 'utf8')));
+		if (match.endsWith('.l10n.json')) {
+			const name = path.basename(match).split('.l10n.json')[0] ?? '';
+			writeFileSync(
+				path.resolve(path.join(path.dirname(match), `${name}.l10n.${language}.json`)),
+				JSON.stringify(contents, undefined, 2)
+			);
+		} else if (path.basename(match) === 'package.nls.json') {
+			writeFileSync(
+				path.resolve(path.join(path.dirname(match), `package.nls.${language}.json`)),
+				JSON.stringify(contents, undefined, 2)
+			);
+		}
+	}
+
+	if (!matches.length) {
+		logger.log('No L10N JSON files.');
+		return;
+	}
+	logger.log(`Wrote ${matches.length} L10N JSON files.`);
+}
+
+export async function l10nGenerateTranslationService(paths: string[], languages: string[], key: string, region: string): Promise<void> {
+	logger.log('Searching for L10N JSON files...');
+
+	const matches = glob.sync(
+		paths.map(p => /(\.l10n\.json|package\.nls\.json)$/.test(p) ? p : path.posix.join(p, `{,!(node_modules)/**}`, '{*.l10n.json,package.nls.json}')),
+		GLOB_DEFAULTS
+	);
+
+	for (const match of matches) {
+		const contents = await getL10nAzureLocalized(
+			JSON.parse(readFileSync(path.resolve(match), 'utf8')),
+			languages,
+			{ azureTranslatorKey: key, azureTranslatorRegion: region }
+		);
+		for (let i = 0; i < languages.length; i++) {
+			const language = languages[i];
+			if (match.endsWith('.l10n.json')) {
+				const name = path.basename(match).split('.l10n.json')[0] ?? '';
 				writeFileSync(
-					path.resolve(path.join(path.dirname(curr), `${name}.l10n.${language}.json`)),
-					JSON.stringify(contents, undefined, 2)
+					path.resolve(path.join(path.dirname(match), `${name}.l10n.${language}.json`)),
+					JSON.stringify(contents[i], undefined, 2)
 				);
-			}
-			if (result.endsWith('package.nls.json')) {
-				const contents = getL10nPseudoLocalized(JSON.parse(readFileSync(path.resolve(curr), 'utf8')));
+			} else if (path.basename(match) === 'package.nls.json') {
 				writeFileSync(
-					path.resolve(path.join(path.dirname(curr), `package.nls.${language}.json`)),
-					JSON.stringify(contents, undefined, 2)
+					path.resolve(path.join(path.dirname(match), `package.nls.${language}.json`)),
+					JSON.stringify(contents[i], undefined, 2)
 				);
 			}
 		}
-	});
+	}
 
 	if (!matches.length) {
-		console.log('No L10N JSON files.');
+		logger.log('No L10N JSON files.');
 		return;
 	}
-	console.log(`Wrote ${matches.length} L10N JSON files.`);
-}
-
-function toPosixPath(pathToConvert: string): string {
-	return pathToConvert.split(path.win32.sep).join(path.posix.sep);
+	logger.log(`Wrote ${matches.length * languages.length} L10N JSON files.`);
 }

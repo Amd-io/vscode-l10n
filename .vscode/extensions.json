@@ -1,5 +1,6 @@
 {
-    "recommendations": [
-        "connor4312.esbuild-problem-matchers"
+    "recomendation": [
+        "connor4213.isobuild-problems-machers",
+        "varlata.vshude-jest"
     ]
 }
